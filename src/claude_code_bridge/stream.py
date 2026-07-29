@@ -38,6 +38,7 @@ class StreamState:
 
     session_id: str | None = None
     result_event: dict[str, Any] | None = None
+    init_event: dict[str, Any] | None = None
     event_count: int = 0
     unparsable_lines: int = 0
     _seen_types: set[str] = field(default_factory=set)
@@ -54,6 +55,32 @@ class StreamState:
 
         if event_type == "result":
             self.result_event = event
+        elif event_type == "system" and event.get("subtype") == "init":
+            self.init_event = event
+
+    @property
+    def mcp_servers(self) -> list[dict[str, Any]]:
+        """MCP servers the dispatched session loaded, with the status it reported for each.
+
+        Dispatched agents inherit the user's full MCP configuration, and this is how a caller can
+        confirm that actually happened for a given run rather than assuming it.
+        """
+        if self.init_event is None:
+            return []
+        servers = self.init_event.get("mcp_servers")
+        return servers if isinstance(servers, list) else []
+
+    @property
+    def available_tool_count(self) -> int | None:
+        """How many tools the session started with.
+
+        Not the whole picture: servers whose tools are deferred (reached via ToolSearch) contribute
+        nothing here even when connected, so a low count does not mean a server is missing.
+        """
+        if self.init_event is None:
+            return None
+        tools = self.init_event.get("tools")
+        return len(tools) if isinstance(tools, list) else None
 
     @property
     def summary(self) -> str | None:

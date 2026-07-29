@@ -145,6 +145,8 @@ class Task:
             "raw_stream_log": str(self.log_path),
             "model": self.model,
             "max_turns": self.max_turns,
+            "mcp_servers": self.state.mcp_servers,
+            "available_tool_count": self.state.available_tool_count,
         }
         # Only meaningful when something went wrong, and usually empty otherwise.
         if self.status == "failed" and self.stderr_tail:

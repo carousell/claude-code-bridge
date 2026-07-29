@@ -133,9 +133,38 @@ you can see when an agent tried to commit and was stopped.
 ### Inherited environment
 
 Dispatched sessions inherit your full Claude Code environment — every MCP server, hook, skill and
-`CLAUDE.md` your own sessions load. That makes them as capable as you are, and it is not free: a
-one-word task measured ~51k cache-creation tokens (~$0.50) purely loading that context. Add
-`--strict-mcp-config` in `cli.py` if you would rather trade capability for cost.
+`CLAUDE.md` your own sessions load. This is deliberate: an agent dispatched from here is meant to be
+as capable as one you run yourself. `cli.FORBIDDEN_FLAGS` makes it structural rather than incidental,
+rejecting `--strict-mcp-config`, `--setting-sources`, `--safe-mode` and `--bare`, so the isolation
+that would break it cannot be introduced by accident.
+
+`get_task_status` returns `mcp_servers` for every run, so you can confirm per task what the agent
+actually loaded rather than assuming. Two things to read correctly there:
+
+- **`pending` does not mean unavailable.** Servers whose tools are deferred (reached through
+  `ToolSearch`) are often still connecting when the status is captured, and contribute nothing to
+  `available_tool_count`. Verified: a dispatched agent reported `owlex` as `pending` at startup and
+  was still able to find and call all 15 of its tools.
+- **`needs-auth` does mean unavailable.** A headless run cannot complete an OAuth flow, so servers
+  in that state are out of reach for dispatched tasks.
+
+Capability has a price: a one-word task measured ~51k cache-creation tokens (~$0.50) purely loading
+this context. It also means a dispatched agent can reach anything you can, including MCP servers that
+dispatch further agents of their own.
+
+### There is no sandbox
+
+Worth being explicit, because `repo_path` reads like a boundary and is not one. Dispatched agents run
+with `--permission-mode bypassPermissions` and have:
+
+- **full filesystem access as you** — `repo_path` is only the working directory. Verified: a
+  dispatched agent read `~/.claude.json`, well outside it.
+- full network access, and every authenticated MCP connection you hold
+- unrestricted `Bash`, apart from the two deny patterns above
+
+Treat a dispatched task as being about as privileged as you are in your own terminal, minus the
+ability to casually land a commit. That is a reasonable trade for work you are supervising; it is
+worth understanding before pointing it at anything you would not run yourself.
 
 ## Development
 

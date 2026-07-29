@@ -116,7 +116,18 @@ README.md — and re-measure rather than reasoning about it.
 
 ## Notes
 
-- Dispatched sessions inherit the full user environment (all MCP servers, hooks, skills,
-  `CLAUDE.md`). That is a deliberate choice, and it costs ~51k cache-creation tokens (~$0.50) per
-  run as a floor. `--strict-mcp-config` is the lever if that changes.
+- **Dispatched sessions must keep inheriting the full user environment** (all MCP servers, hooks,
+  skills, `CLAUDE.md`) — that capability is the point, not a side effect. `cli.FORBIDDEN_FLAGS`
+  enforces it: `--strict-mcp-config`, `--setting-sources`, `--safe-mode` and `--bare` are rejected by
+  `assert_safe`, with tests, because any one of them would silently cut a dispatched task off from
+  servers like owlex or argent. Do not add them as an optimisation; the cost floor (~51k
+  cache-creation tokens, ~$0.50 a run) is a known and accepted trade.
+- `mcp_servers` and `available_tool_count` in a snapshot come from the run's own `system/init`
+  event. `pending` there usually means a deferred-tool server was still connecting — its tools are
+  still reachable via `ToolSearch` and contribute nothing to `available_tool_count`, so do not read
+  a low count or a `pending` status as a missing server. `needs-auth` genuinely is unusable
+  headlessly.
+- **Nothing is sandboxed.** `repo_path` is a working directory, not a boundary: a dispatched agent
+  has full filesystem and network access as the user, plus every authenticated MCP connection. Only
+  the commit/push deny patterns are enforced.
 - Log to **stderr only**. stdout is the MCP wire; anything printed there corrupts the protocol.

@@ -6,6 +6,7 @@ import pytest
 
 from claude_code_bridge.cli import (
     DISALLOWED_TOOLS,
+    FORBIDDEN_FLAGS,
     UnsafeInvocationError,
     assert_safe,
     build_claude_argv,
@@ -31,6 +32,28 @@ def test_commit_and_push_are_denied(kind: str) -> None:
     assert denied == DISALLOWED_TOOLS
     assert "Bash(git commit:*)" in denied
     assert "Bash(git push:*)" in denied
+
+
+@pytest.mark.parametrize("kind", sorted(INVOCATIONS))
+def test_dispatched_agents_inherit_the_users_mcp_servers(kind: str) -> None:
+    """Inheriting the user's MCP config is a feature, so nothing may isolate the child.
+
+    Without this, an agent dispatched from here could not reach owlex, argent, or any other server
+    the user has configured — and the flag that breaks it is a one-word addition.
+    """
+    argv = build_claude_argv("do a thing", **INVOCATIONS[kind])
+
+    for flag in FORBIDDEN_FLAGS:
+        assert flag not in argv
+
+
+@pytest.mark.parametrize("flag", FORBIDDEN_FLAGS)
+def test_assert_safe_rejects_flags_that_isolate_the_agent(flag: str) -> None:
+    argv = build_claude_argv("do a thing", session_id=SESSION)
+    argv.append(flag)
+
+    with pytest.raises(UnsafeInvocationError, match="cut the dispatched agent off"):
+        assert_safe(argv)
 
 
 @pytest.mark.parametrize("kind", sorted(INVOCATIONS))

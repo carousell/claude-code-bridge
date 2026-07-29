@@ -293,6 +293,8 @@ def snapshot(log_dir: Path, record: TaskRecord) -> dict[str, Any]:
         "raw_stream_log": str(log_path(log_dir, record.task_id)),
         "model": record.model,
         "max_turns": record.max_turns,
+        "mcp_servers": state.mcp_servers,
+        "available_tool_count": state.available_tool_count,
         "recovered": True,
         "note": note,
     }

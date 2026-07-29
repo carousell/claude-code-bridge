@@ -152,6 +152,11 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     Includes the agent's closing summary, cost, turn count and any permission_denials once the
     run has finished, plus the tail of its event stream while it is still going.
 
+    `mcp_servers` reports the MCP servers the dispatched session loaded, as it saw them at startup.
+    A status of `pending` there usually means a server whose tools are deferred was still connecting
+    — those tools are still reachable, via ToolSearch — so it does not mean the server is
+    unavailable. `needs-auth` does mean unusable, since a headless run cannot complete OAuth.
+
     Tasks started by an earlier bridge server process are still reported, read back from disk. Those
     carry `recovered: true` and a `note` explaining what is and is not known about them.
     """

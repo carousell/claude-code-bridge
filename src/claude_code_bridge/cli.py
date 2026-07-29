@@ -17,6 +17,12 @@ DISALLOWED_TOOLS = "Bash(git commit:*),Bash(git push:*)"
 # Required, not stylistic: `claude -p --output-format stream-json` refuses to start without it.
 _REQUIRED_FLAGS = ("--verbose", "--disallowedTools", "--permission-mode")
 
+# Flags that would cut a dispatched agent off from the user's own MCP servers, settings, hooks and
+# CLAUDE.md. Inheriting all of that is a deliberate feature — an agent dispatched from here is meant
+# to be as capable as the user's own sessions — so these are refused rather than merely unused.
+# Removing them would silently break, for example, reaching owlex or argent from a dispatched task.
+FORBIDDEN_FLAGS = ("--strict-mcp-config", "--setting-sources", "--safe-mode", "--bare")
+
 # Every argv this module builds starts ["claude", "-p", <prompt>]; options begin after the prompt.
 _FLAGS_START = 3
 
@@ -93,6 +99,13 @@ def assert_safe(argv: list[str]) -> None:
             # A later duplicate can override the earlier one, so a single occurrence is required
             # rather than merely a correct first one.
             raise UnsafeInvocationError(f"{flag} appears {occurrences} times: {argv!r}")
+
+    for flag in FORBIDDEN_FLAGS:
+        if flag in flags:
+            raise UnsafeInvocationError(
+                f"{flag} would cut the dispatched agent off from the user's MCP servers and "
+                f"settings, which it is meant to inherit: {argv!r}"
+            )
 
     denied = flags[flags.index("--disallowedTools") + 1]
     if denied != DISALLOWED_TOOLS:
