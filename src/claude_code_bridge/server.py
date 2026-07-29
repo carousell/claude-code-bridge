@@ -1,0 +1,241 @@
+"""MCP server exposing headless Claude Code dispatch as tools."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from mcp import MCPError
+from mcp.server import MCPServer
+from mcp.types import INVALID_PARAMS
+
+from .cli import CLAUDE_BINARY, DEFAULT_MAX_TURNS, DISALLOWED_TOOLS
+from .tasks import TERMINAL_STATUSES, SessionBusyError, Task, TaskRegistry
+
+log = logging.getLogger("claude_code_bridge")
+
+VALID_STATUSES = frozenset({"running"}) | TERMINAL_STATUSES
+
+mcp = MCPServer(
+    "claude-code-bridge",
+    instructions=(
+        "Dispatch coding tasks to headless Claude Code sessions on this machine. "
+        "start_claude_code_task returns immediately with a task_id; poll it with "
+        "get_task_status or await it with wait_for_task, then continue the same session with "
+        "resume_claude_code_task. Dispatched agents run with permission prompts bypassed but "
+        "with git commit and git push denied, so review and commit their work yourself."
+    ),
+)
+
+_registry: TaskRegistry | None = None
+
+
+def _reg() -> TaskRegistry:
+    # Built lazily so its asyncio primitives belong to the loop `mcp.run()` creates.
+    global _registry
+    if _registry is None:
+        _registry = TaskRegistry()
+    return _registry
+
+
+def _require_task(task_id: str) -> Task:
+    task = _reg().get(task_id)
+    if task is None:
+        raise MCPError(INVALID_PARAMS, f"unknown task_id: {task_id}")
+    return task
+
+
+def _check_max_turns(max_turns: int) -> None:
+    if max_turns < 1:
+        raise MCPError(INVALID_PARAMS, f"max_turns must be >= 1, got {max_turns}")
+
+
+def _resolve_repo_path(repo_path: str) -> Path:
+    if not repo_path or not repo_path.strip():
+        raise MCPError(INVALID_PARAMS, "repo_path must be a non-empty path")
+
+    path = Path(repo_path).expanduser()
+    try:
+        path = path.resolve(strict=True)
+    except OSError:
+        raise MCPError(INVALID_PARAMS, f"repo_path does not exist: {repo_path}") from None
+    if not path.is_dir():
+        raise MCPError(INVALID_PARAMS, f"repo_path is not a directory: {path}")
+
+    probe = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0 or probe.stdout.strip() != "true":
+        raise MCPError(INVALID_PARAMS, f"repo_path is not inside a git repository: {path}")
+    return path
+
+
+async def _validate_repo_path(repo_path: str) -> Path:
+    return await asyncio.to_thread(_resolve_repo_path, repo_path)
+
+
+def _require_claude() -> None:
+    if shutil.which(CLAUDE_BINARY) is None:
+        raise MCPError(
+            INVALID_PARAMS,
+            f"the `{CLAUDE_BINARY}` CLI was not found on PATH; install Claude Code first",
+        )
+
+
+@mcp.tool()
+async def start_claude_code_task(
+    prompt: str,
+    repo_path: str,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Dispatch a coding task to a new headless Claude Code session and return immediately.
+
+    Args:
+        prompt: Instructions for the agent. Be specific about the desired end state.
+        repo_path: Absolute path to a git repository; the agent's working directory.
+        max_turns: Cap on agent turns before the run is stopped.
+        model: Model alias or full name (e.g. "opus", "sonnet"). Defaults to Claude Code's own.
+
+    Returns the new task_id and its starting state. The run continues in the background; poll
+    get_task_status or call wait_for_task to follow it.
+    """
+    _require_claude()
+    _check_max_turns(max_turns)
+    if not prompt or not prompt.strip():
+        raise MCPError(INVALID_PARAMS, "prompt must be a non-empty string")
+
+    path = await _validate_repo_path(repo_path)
+    task = await _reg().start(prompt, path, max_turns=max_turns, model=model)
+    return task.brief()
+
+
+@mcp.tool()
+async def get_task_status(task_id: str) -> dict[str, Any]:
+    """Report a dispatched task's current state without blocking.
+
+    Args:
+        task_id: Identifier returned by start_claude_code_task or resume_claude_code_task.
+
+    Includes the agent's closing summary, cost, turn count and any permission_denials once the
+    run has finished, plus the tail of its event stream while it is still going.
+    """
+    return _require_task(task_id).snapshot()
+
+
+@mcp.tool()
+async def wait_for_task(task_id: str, timeout_seconds: int = 600) -> dict[str, Any]:
+    """Wait for a task to finish, giving up after a timeout without disturbing the run.
+
+    Args:
+        task_id: Identifier of the task to await.
+        timeout_seconds: How long to wait before returning early.
+
+    On timeout the task is left running and the returned status is still "running", so you can
+    call again later or switch to polling. The process is never signalled here.
+    """
+    if timeout_seconds <= 0:
+        raise MCPError(INVALID_PARAMS, f"timeout_seconds must be > 0, got {timeout_seconds}")
+
+    task = _require_task(task_id)
+    try:
+        await asyncio.wait_for(task.done.wait(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        log.info("task %s still running after %ss wait", task_id, timeout_seconds)
+    return task.snapshot()
+
+
+@mcp.tool()
+async def resume_claude_code_task(
+    task_id: str,
+    followup_prompt: str,
+    max_turns: int = DEFAULT_MAX_TURNS,
+) -> dict[str, Any]:
+    """Continue a finished task's session with follow-up instructions.
+
+    Args:
+        task_id: A task that has finished; its session is the one resumed.
+        followup_prompt: What the agent should do next, with the prior context intact.
+        max_turns: Cap on agent turns for this continuation.
+
+    Returns a new task_id sharing the original session_id, and returns immediately as with
+    start_claude_code_task.
+    """
+    _require_claude()
+    _check_max_turns(max_turns)
+    if not followup_prompt or not followup_prompt.strip():
+        raise MCPError(INVALID_PARAMS, "followup_prompt must be a non-empty string")
+
+    parent = _require_task(task_id)
+    # `finished`, not the status field: a cancellation in progress is not yet safe to resume from.
+    if not parent.finished:
+        raise MCPError(
+            INVALID_PARAMS,
+            f"task {task_id} is still {parent.status}; wait for it or cancel it before resuming",
+        )
+
+    try:
+        task = await _reg().resume(parent, followup_prompt, max_turns=max_turns)
+    except SessionBusyError as exc:
+        raise MCPError(INVALID_PARAMS, str(exc)) from None
+    return task.brief()
+
+
+@mcp.tool()
+async def list_tasks(status: str | None = None) -> list[dict[str, Any]]:
+    """List dispatched tasks, oldest first.
+
+    Args:
+        status: Optional filter — one of running, completed, failed, timed_out, cancelled.
+    """
+    if status is not None and status not in VALID_STATUSES:
+        raise MCPError(
+            INVALID_PARAMS,
+            f"unknown status {status!r}; expected one of {sorted(VALID_STATUSES)}",
+        )
+    return [task.brief() for task in _reg().list(status)]
+
+
+@mcp.tool()
+async def cancel_task(task_id: str) -> dict[str, Any]:
+    """Stop a running task, terminating the agent and any processes it spawned.
+
+    Args:
+        task_id: Identifier of the task to stop.
+
+    Already-finished tasks are returned unchanged. Work the agent had already written to disk is
+    left in place.
+    """
+    task = _require_task(task_id)
+    await _reg().cancel(task)
+    return task.snapshot()
+
+
+def main() -> None:
+    """Entry point for the `claude-code-bridge-server` console script."""
+    logging.basicConfig(
+        level=os.environ.get("CCB_LOG_LEVEL", "INFO").upper(),
+        # stderr, never stdout: stdout is the MCP wire.
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
+    )
+    if shutil.which(CLAUDE_BINARY) is None:
+        log.warning(
+            "`%s` is not on PATH; dispatch tools will fail until Claude Code is installed",
+            CLAUDE_BINARY,
+        )
+    log.info("claude-code-bridge starting (denied tools: %s)", DISALLOWED_TOOLS)
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

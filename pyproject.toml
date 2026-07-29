@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-code-bridge"
+version = "0.1.0"
+description = "Local MCP server that dispatches coding tasks to headless Claude Code sessions"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["mcp>=2.0,<3"]
+
+[project.scripts]
+claude-code-bridge-server = "claude_code_bridge.server:main"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_code_bridge"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: spawns a real `claude` process; spends real tokens. Opt in with CCB_INTEGRATION=1",
+]
