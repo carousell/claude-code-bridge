@@ -59,7 +59,7 @@ Set `CCB_LOG_LEVEL=DEBUG` in the server's environment for per-event logging.
 |---|---|---|
 | `start_claude_code_task(prompt, repo_path, max_turns=50, model=None)` | No | Spawns a new headless session in `repo_path`, returns a `task_id` immediately |
 | `get_task_status(task_id)` | No | Current status, closing summary, cost, turns, permission denials, stream tail |
-| `wait_for_task(task_id, timeout_seconds=600)` | Until done or timeout | On timeout returns `status: "running"` and **leaves the run alone** |
+| `wait_for_task(task_id, timeout_seconds=55)` | Until done or timeout | On timeout returns `status: "running"` and **leaves the run alone** |
 | `resume_claude_code_task(task_id, followup_prompt, max_turns=50)` | No | Continues that task's session as a **new** `task_id` with the same `session_id` |
 | `list_tasks(status=None)` | No | All tasks, oldest first, optionally filtered |
 | `cancel_task(task_id)` | Until dead | SIGTERM the run's process group, SIGKILL after 5s |
@@ -68,11 +68,27 @@ Statuses are `running`, `completed`, `failed`, `timed_out` (turn limit exhausted
 `cancelled`. Each run's full raw event stream is kept at
 `~/.claude-code-bridge/tasks/<task_id>.jsonl` for post-mortems; `get_task_status` returns the path.
 
-The task registry is in memory. It targets 200 entries, reclaiming space from the oldest *finished*
-tasks whenever a task starts or finishes. Live tasks are never evicted, so the registry can exceed
-that target while more than 200 runs are in flight and settles back as they finish. Restarting the
-server loses the registry, but the `session_id`s it reported stay resumable with
-`claude --resume <session_id>` directly.
+### Waiting
+
+`wait_for_task` returning `status: "running"` is not a failure — the run is untouched and the
+result carries a `next_step` hint. Just call again, or poll `get_task_status`.
+
+The default wait is deliberately short. MCP clients apply their own per-request timeout, often 60
+seconds, and exceeding it fails the *call* with `MCP error -32001: Request timed out` even though the
+dispatched task carries on. Progress is reported every few seconds while waiting, which lets clients
+that honour it hold longer waits open.
+
+### Tasks outlive the server process
+
+A client may run several bridge servers, or restart one. Each task therefore writes a
+`<task_id>.meta.json` beside its stream log, so any server can still report on tasks it did not
+start — those come back marked `recovered: true` with a `note` describing what is known. Status,
+cancellation and resume all work on them. If a recovered task's outcome was never recorded, it is
+reconstructed from the run's own output.
+
+The in-memory registry targets 200 entries, reclaiming space from the oldest *finished* tasks
+whenever a task starts or finishes. Live tasks are never evicted, so it can exceed that target while
+more than 200 runs are in flight and settles back as they finish.
 
 A session is only ever driven by one process at a time: resuming a task is refused while any run
 on its session is still live, since two `--resume` processes would fight over the same conversation

@@ -81,6 +81,21 @@ inside the block and re-raises after closing — copy that pattern.
    children can outlive it holding the pipes open.
 6. **One live run per session.** `resume` is refused while any task on that `session_id` is
    unfinished; two `--resume` processes would corrupt shared conversation state.
+7. **The server process is not stable — the task outlives it.** A client may run several bridge
+   servers at once or restart one, and an in-memory-only registry meant a task was invisible to any
+   process that did not spawn it (verified: the desktop app ran a second server 8 minutes after the
+   first, and `get_task_status` answered "unknown task_id" while the run continued, unreachable).
+   Every task therefore persists a `store.TaskRecord` sidecar; `store.snapshot` replays the stream
+   log to rebuild the outcome. Keep the recovered snapshot's keys a superset of `Task.snapshot()` —
+   a test enforces it — so callers never special-case recovery.
+
+## Telling the caller what happened
+
+The caller is usually a model, and it only knows what the tool surface says. So state changes it
+cannot infer must be *in the payload*, not just in the docs: `recovered: true` plus a plain-language
+`note` on recovered tasks, a `next_step` hint when a wait returns still-running, the constraint
+written into `wait_for_task`'s docstring, and errors that say what to do instead of just what failed.
+When adding behaviour that surprises a caller, add the words that explain it too.
 
 ## Where the safety boundary actually falls
 

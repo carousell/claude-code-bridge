@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+from claude_code_bridge import store
 from claude_code_bridge import tasks as tasks_module
 from claude_code_bridge.tasks import (
     TERMINAL_STATUSES,
+    RepoUnavailableError,
     SessionBusyError,
     Task,
     TaskRegistry,
@@ -174,6 +176,77 @@ async def test_a_cancelled_monitor_still_publishes_a_terminal_status(tmp_path: P
         watcher.cancel()
     await asyncio.gather(*task.watchers, return_exceptions=True)
     await proc.wait()
+
+
+async def test_cancel_recovered_does_not_claim_success_it_cannot_deliver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Marking it cancelled when the signal failed would have later calls contradict this one."""
+    registry = TaskRegistry(log_dir=tmp_path)
+    record = store.TaskRecord(
+        task_id="orphan",
+        session_id="s1",
+        repo_path=str(tmp_path),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        pid=1234,
+        pgid=None,  # nothing to signal
+    )
+    store.write(tmp_path, record)
+    monkeypatch.setattr(store, "process_alive", lambda pid, session: True)
+
+    result = await registry.cancel_recovered(record)
+
+    assert result.status == "running"
+    assert store.read(tmp_path, "orphan").status == "running"
+
+
+async def test_cancel_recovered_of_an_already_dead_task_changes_nothing(tmp_path: Path) -> None:
+    registry = TaskRegistry(log_dir=tmp_path)
+    record = store.TaskRecord(
+        task_id="orphan",
+        session_id="s1",
+        repo_path=str(tmp_path),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        pid=999_999_999,
+        pgid=999_999_999,
+    )
+
+    assert (await registry.cancel_recovered(record)).status == "running"
+
+
+async def test_session_exclusivity_spans_server_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process's live run on this session must also block a resume."""
+    registry = TaskRegistry(log_dir=tmp_path)
+    monkeypatch.setattr(store, "process_alive", lambda pid, session: True)
+    store.write(
+        tmp_path,
+        store.TaskRecord(
+            task_id="elsewhere",
+            session_id="shared",
+            repo_path=str(tmp_path),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            pid=4321,
+        ),
+    )
+
+    assert registry.session_has_live_run("shared")
+    assert not registry.session_has_live_run("unrelated")
+
+
+async def test_resuming_a_task_whose_repo_is_gone_fails_clearly(tmp_path: Path) -> None:
+    registry = TaskRegistry(log_dir=tmp_path)
+    record = store.TaskRecord(
+        task_id="old",
+        session_id="s1",
+        repo_path=str(tmp_path / "deleted-repo"),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        status="completed",
+    )
+
+    with pytest.raises(RepoUnavailableError, match="no longer exists"):
+        await registry.resume_record(record, "carry on")
 
 
 async def test_cancelling_a_finished_task_is_a_no_op(tmp_path: Path) -> None:

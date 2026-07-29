@@ -21,11 +21,12 @@ import os
 import signal
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 
+from . import store
 from .cli import DEFAULT_MAX_TURNS, assert_safe, build_claude_argv
 from .stream import StreamState, parse_line
 
@@ -59,6 +60,10 @@ MAX_TASKS = 200
 
 class SessionBusyError(RuntimeError):
     """A session already has a live run, so a second one would fight it for session state."""
+
+
+class RepoUnavailableError(RuntimeError):
+    """A recovered task's repository is no longer there to resume into."""
 
 
 def _now() -> datetime:
@@ -254,6 +259,10 @@ class TaskRegistry:
             pgid=proc.pid,
         )
 
+        # Written before anything can go wrong, so even a task whose server dies immediately is
+        # discoverable by whichever process comes next.
+        self.persist(task)
+
         task.watchers = [
             asyncio.create_task(_drain_stdout(task), name=f"ccb-stdout-{task_id}"),
             asyncio.create_task(_drain_stderr(task), name=f"ccb-stderr-{task_id}"),
@@ -275,8 +284,44 @@ class TaskRegistry:
         )
         return task
 
+    @property
+    def log_dir(self) -> Path:
+        return self._log_dir
+
+    def persist(self, task: Task) -> None:
+        store.write(
+            self._log_dir,
+            store.TaskRecord(
+                task_id=task.task_id,
+                session_id=task.session_id,
+                repo_path=str(task.repo_path),
+                started_at=task.started_at.isoformat(),
+                pid=task.proc.pid if task.proc is not None else None,
+                pgid=task.pgid,
+                model=task.model,
+                max_turns=task.max_turns,
+                parent_task_id=task.parent_task_id,
+                prompt=task.prompt[: store.PROMPT_PREVIEW_CHARS],
+                status=task.status,
+                exit_code=task.exit_code,
+                finished_at=task.finished_at.isoformat() if task.finished_at else None,
+            ),
+        )
+
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
+
+    def recover(self, task_id: str) -> store.TaskRecord | None:
+        """A task this process did not spawn, read back from disk."""
+        return store.read(self._log_dir, task_id)
+
+    def recovered_briefs(self, exclude: set[str]) -> list[dict[str, Any]]:
+        """Listing entries for on-disk tasks not held in memory."""
+        return [
+            store.brief(self._log_dir, record)
+            for record in store.read_all(self._log_dir)
+            if record.task_id not in exclude
+        ]
 
     def list(self, status: str | None = None) -> list[Task]:
         tasks = sorted(self._tasks.values(), key=lambda t: t.started_at)
@@ -285,9 +330,16 @@ class TaskRegistry:
         return [t for t in tasks if t.status == status]
 
     def session_has_live_run(self, session_id: str) -> bool:
-        return any(
+        """Whether any run on this session is live, including ones another server process started.
+
+        Checking only our own registry would let two bridge processes resume the same session at
+        once, which is exactly the concurrent mutation this guard exists to prevent.
+        """
+        if any(
             task.session_id == session_id and not task.finished for task in self._tasks.values()
-        )
+        ):
+            return True
+        return session_id in store.live_session_ids(self._log_dir)
 
     async def cancel(self, task: Task) -> Task:
         """Stop a run, waiting for it to actually die before returning.
@@ -326,6 +378,84 @@ class TaskRegistry:
             log.info("task %s cancelled", task.task_id)
         return task
 
+    async def cancel_recovered(self, record: store.TaskRecord) -> store.TaskRecord:
+        """Stop a task this process never spawned, using its recorded process group.
+
+        There is no subprocess handle to wait on, so liveness is polled instead. The record is only
+        marked cancelled if the process was actually ours and actually signalled — otherwise the
+        response would claim an outcome that never happened.
+        """
+        alive = store.process_alive(record.pid, record.session_id)
+        if not alive:
+            log.info("recovered task %s was already gone; nothing to cancel", record.task_id)
+            return record
+
+        # Attempted even though the leader looked alive a moment ago: the group may hold children
+        # that outlive it and keep the run's pipes open.
+        signalled = _signal_recorded_group(record, signal.SIGTERM)
+        if signalled:
+            deadline = asyncio.get_running_loop().time() + SIGKILL_GRACE_SECONDS
+            while asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.25)
+                if not store.process_alive(record.pid, record.session_id):
+                    break
+            else:
+                log.warning("recovered task %s ignored SIGTERM, sending SIGKILL", record.task_id)
+                _signal_recorded_group(record, signal.SIGKILL)
+
+        if not signalled:
+            log.warning(
+                "recovered task %s looked alive but could not be signalled; leaving its record "
+                "untouched rather than claiming it was cancelled",
+                record.task_id,
+            )
+            return record
+
+        cancelled = replace(
+            record, status="cancelled", finished_at=record.finished_at or _now().isoformat()
+        )
+        store.write(self._log_dir, cancelled)
+        log.info("recovered task %s cancelled", record.task_id)
+        return cancelled
+
+    async def resume_record(
+        self,
+        record: store.TaskRecord,
+        followup_prompt: str,
+        *,
+        max_turns: int = DEFAULT_MAX_TURNS,
+    ) -> Task:
+        """Continue the session of a task recovered from disk."""
+        if self.session_has_live_run(record.session_id):
+            raise SessionBusyError(
+                f"session {record.session_id} already has a running task; "
+                "two concurrent runs would corrupt its shared conversation state"
+            )
+
+        # Revalidated rather than trusted: the recorded path may have been deleted, or replaced by
+        # a different repository, since the original run.
+        repo_path = Path(record.repo_path)
+        if not repo_path.is_dir():
+            raise RepoUnavailableError(
+                f"the repository this task ran in no longer exists: {record.repo_path}"
+            )
+
+        argv = build_claude_argv(
+            followup_prompt,
+            resume_session_id=record.session_id,
+            max_turns=max_turns,
+            model=record.model,
+        )
+        return await self._spawn(
+            argv,
+            prompt=followup_prompt,
+            repo_path=repo_path,
+            session_id=record.session_id,
+            max_turns=max_turns,
+            model=record.model,
+            parent_task_id=record.task_id,
+        )
+
     def prune(self) -> None:
         """Drop the oldest finished tasks once over capacity.
 
@@ -342,6 +472,17 @@ class TaskRegistry:
         for task in [t for t in self.list() if t.finished][:overflow]:
             del self._tasks[task.task_id]
             log.debug("evicted finished task %s", task.task_id)
+
+
+def _signal_recorded_group(record: store.TaskRecord, sig: int) -> bool:
+    """Signal a recovered task's process group. False if it could not be signalled."""
+    if record.pgid is None:
+        return False
+    try:
+        os.killpg(record.pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
 
 
 def _signal_group(task: Task, sig: int) -> bool:
@@ -536,9 +677,10 @@ async def _monitor(task: Task, registry: TaskRegistry) -> None:
             task.finished_at = task.finished_at or _now()
         task.done.set()
         try:
+            registry.persist(task)
             registry.prune()
-        except Exception:  # pragma: no cover - pruning must never mask a finished run
-            log.exception("task %s: pruning the registry failed", task.task_id)
+        except Exception:  # pragma: no cover - bookkeeping must never mask a finished run
+            log.exception("task %s: recording the finished run failed", task.task_id)
 
 
 def _classify(task: Task, exit_code: int) -> Status:

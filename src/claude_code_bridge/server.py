@@ -17,8 +17,15 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.types import INVALID_PARAMS
 
+from . import store
 from .cli import CLAUDE_BINARY, DEFAULT_MAX_TURNS, DISALLOWED_TOOLS
-from .tasks import TERMINAL_STATUSES, SessionBusyError, Task, TaskRegistry
+from .tasks import (
+    TERMINAL_STATUSES,
+    RepoUnavailableError,
+    SessionBusyError,
+    Task,
+    TaskRegistry,
+)
 
 log = logging.getLogger("claude_code_bridge")
 
@@ -41,7 +48,11 @@ mcp = MCPServer(
         "start_claude_code_task returns immediately with a task_id; poll it with "
         "get_task_status or await it with wait_for_task, then continue the same session with "
         "resume_claude_code_task. Dispatched agents run with permission prompts bypassed but "
-        "with git commit and git push denied, so review and commit their work yourself."
+        "with git commit and git push denied, so review and commit their work yourself.\n\n"
+        "Two things worth knowing. A wait_for_task that comes back still 'running' has not failed "
+        "— the run is untouched, so call again or poll get_task_status. And tasks outlive this "
+        "server process: ones started by an earlier bridge server are still reported, marked "
+        "'recovered: true' with a 'note' saying what is known about them."
     ),
 )
 
@@ -140,8 +151,22 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
 
     Includes the agent's closing summary, cost, turn count and any permission_denials once the
     run has finished, plus the tail of its event stream while it is still going.
+
+    Tasks started by an earlier bridge server process are still reported, read back from disk. Those
+    carry `recovered: true` and a `note` explaining what is and is not known about them.
     """
-    return _require_task(task_id).snapshot()
+    task = _reg().get(task_id)
+    if task is not None:
+        return task.snapshot()
+
+    record = _reg().recover(task_id)
+    if record is None:
+        raise MCPError(
+            INVALID_PARAMS,
+            f"unknown task_id: {task_id}. No task with that id is running, and no record of one "
+            f"exists under {_reg().log_dir}. Use list_tasks to see what is known.",
+        )
+    return store.snapshot(_reg().log_dir, record)
 
 
 async def _await_with_progress(task: Task, timeout_seconds: int, ctx: Context | None) -> None:
@@ -174,6 +199,44 @@ async def _await_with_progress(task: Task, timeout_seconds: int, ctx: Context | 
             log.debug("task %s: client did not accept progress", task.task_id)
 
 
+async def _poll_recovered(
+    record: store.TaskRecord, timeout_seconds: int, ctx: Context | None
+) -> store.TaskRecord:
+    """Wait on a task from another server process by polling its liveness.
+
+    There is no completion event to await here, so this checks the recorded process on the same
+    cadence it reports progress, and re-reads the record in case that process's own server
+    finishes it first.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    steps = max(1, math.ceil(timeout_seconds / PROGRESS_INTERVAL_SECONDS))
+
+    for step in range(1, steps + 1):
+        if loop.time() >= deadline:
+            break
+        if not store.process_alive(record.pid, record.session_id):
+            break
+        await asyncio.sleep(min(PROGRESS_INTERVAL_SECONDS, max(0.0, deadline - loop.time())))
+
+        fresh = _reg().recover(record.task_id)
+        if fresh is not None:
+            record = fresh
+        if record.status in TERMINAL_STATUSES:
+            break
+
+        if ctx is None:
+            continue
+        try:
+            await ctx.report_progress(
+                step, total=steps, message=f"{record.task_id} still running (recovered task)"
+            )
+        except Exception:  # pragma: no cover - a client that ignores progress must not break us
+            log.debug("task %s: client did not accept progress", record.task_id)
+
+    return record
+
+
 @mcp.tool()
 async def wait_for_task(
     task_id: str,
@@ -198,11 +261,25 @@ async def wait_for_task(
     if timeout_seconds <= 0:
         raise MCPError(INVALID_PARAMS, f"timeout_seconds must be > 0, got {timeout_seconds}")
 
-    task = _require_task(task_id)
-    await _await_with_progress(task, timeout_seconds, ctx)
+    task = _reg().get(task_id)
+    if task is not None:
+        await _await_with_progress(task, timeout_seconds, ctx)
+        snapshot = task.snapshot()
+        finished = task.finished
+    else:
+        # A task from an earlier server process is waitable too; get_task_status reports it, so
+        # refusing to wait on it here would just be an inconsistency the caller has to work around.
+        record = _reg().recover(task_id)
+        if record is None:
+            raise MCPError(
+                INVALID_PARAMS,
+                f"unknown task_id: {task_id}. Use list_tasks to see what is known.",
+            )
+        record = await _poll_recovered(record, timeout_seconds, ctx)
+        snapshot = store.snapshot(_reg().log_dir, record)
+        finished = snapshot["status"] in TERMINAL_STATUSES
 
-    snapshot = task.snapshot()
-    if not task.finished:
+    if not finished:
         log.info("task %s still running after %ss wait", task_id, timeout_seconds)
         snapshot["next_step"] = (
             f"still running after {timeout_seconds}s and unaffected by this wait — "
@@ -232,17 +309,29 @@ async def resume_claude_code_task(
     if not followup_prompt or not followup_prompt.strip():
         raise MCPError(INVALID_PARAMS, "followup_prompt must be a non-empty string")
 
-    parent = _require_task(task_id)
-    # `finished`, not the status field: a cancellation in progress is not yet safe to resume from.
-    if not parent.finished:
-        raise MCPError(
-            INVALID_PARAMS,
-            f"task {task_id} is still {parent.status}; wait for it or cancel it before resuming",
-        )
-
+    parent = _reg().get(task_id)
     try:
-        task = await _reg().resume(parent, followup_prompt, max_turns=max_turns)
-    except SessionBusyError as exc:
+        if parent is not None:
+            # `finished`, not the status field: a cancellation in progress is not resumable yet.
+            if not parent.finished:
+                raise MCPError(
+                    INVALID_PARAMS,
+                    f"task {task_id} is still {parent.status}; wait for it or cancel it "
+                    "before resuming",
+                )
+            task = await _reg().resume(parent, followup_prompt, max_turns=max_turns)
+        else:
+            record = _reg().recover(task_id)
+            if record is None:
+                raise MCPError(INVALID_PARAMS, f"unknown task_id: {task_id}")
+            if store.process_alive(record.pid, record.session_id):
+                raise MCPError(
+                    INVALID_PARAMS,
+                    f"task {task_id} is still running (started by an earlier bridge server "
+                    "process); wait for it or cancel it before resuming",
+                )
+            task = await _reg().resume_record(record, followup_prompt, max_turns=max_turns)
+    except (SessionBusyError, RepoUnavailableError) as exc:
         raise MCPError(INVALID_PARAMS, str(exc)) from None
     return task.brief()
 
@@ -253,13 +342,23 @@ async def list_tasks(status: str | None = None) -> list[dict[str, Any]]:
 
     Args:
         status: Optional filter — one of running, completed, failed, timed_out, cancelled.
+
+    Includes tasks from earlier bridge server processes, marked `recovered: true`.
     """
     if status is not None and status not in VALID_STATUSES:
         raise MCPError(
             INVALID_PARAMS,
             f"unknown status {status!r}; expected one of {sorted(VALID_STATUSES)}",
         )
-    return [task.brief() for task in _reg().list(status)]
+
+    live = _reg().list()
+    entries = [task.brief() for task in live]
+    entries.extend(_reg().recovered_briefs(exclude={task.task_id for task in live}))
+    entries.sort(key=lambda entry: entry["started_at"])
+
+    if status is not None:
+        entries = [entry for entry in entries if entry["status"] == status]
+    return entries
 
 
 @mcp.tool()
@@ -270,11 +369,21 @@ async def cancel_task(task_id: str) -> dict[str, Any]:
         task_id: Identifier of the task to stop.
 
     Already-finished tasks are returned unchanged. Work the agent had already written to disk is
-    left in place.
+    left in place. Tasks started by an earlier bridge server process can be stopped too, via their
+    recorded process group.
     """
-    task = _require_task(task_id)
-    await _reg().cancel(task)
-    return task.snapshot()
+    task = _reg().get(task_id)
+    if task is not None:
+        await _reg().cancel(task)
+        return task.snapshot()
+
+    record = _reg().recover(task_id)
+    if record is None:
+        raise MCPError(INVALID_PARAMS, f"unknown task_id: {task_id}")
+
+    # Snapshot the record cancellation produced, not the one we started from, or the response
+    # would report a status that later calls contradict.
+    return store.snapshot(_reg().log_dir, await _reg().cancel_recovered(record))
 
 
 def main() -> None:
