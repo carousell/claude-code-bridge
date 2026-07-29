@@ -10,23 +10,46 @@ anything, or resume the same conversation with follow-up instructions.
 ## Installation
 
 ```bash
-uv tool install .
+git clone https://github.com/carousell/claude-code-bridge.git
+cd claude-code-bridge
+./install.sh
 ```
 
-That puts `claude-code-bridge-server` on your PATH. It needs the `claude` CLI installed and
-authenticated — the bridge shells out to it.
+Then **restart the Claude desktop app** — MCP servers are only read at launch.
 
-Add it to your client's `mcp.json`:
+The script installs `uv` if you don't have it, installs the server, and registers it with the
+desktop app. It merges into your existing config rather than replacing it, and takes a timestamped
+backup first. Running it again is safe.
+
+It does not install Claude Code itself, which the bridge dispatches to. If that's missing the
+script tells you how to get it; install it and re-run `./install.sh`.
+
+To see what it would write without touching anything:
+
+```bash
+claude-code-bridge-setup --dry-run
+```
+
+### Configuring it by hand
+
+If you'd rather not run the script, note that **both paths must be absolute**:
 
 ```json
 {
   "mcpServers": {
     "claude-code-bridge": {
-      "command": "claude-code-bridge-server"
+      "command": "/Users/you/.local/bin/claude-code-bridge-server",
+      "env": { "PATH": "/Users/you/.local/bin:/usr/local/bin:/usr/bin:/bin" }
     }
   }
 }
 ```
+
+A desktop app doesn't inherit your shell `PATH`, so `"command": "claude-code-bridge-server"` won't
+resolve, and without the `PATH` entry the server can't find `claude` — every dispatch then fails
+with a misleading error. Point `PATH` at the directory holding the `claude` symlink
+(`~/.local/bin`), not at whatever it resolves to: that target is version-specific and changes when
+Claude Code updates itself.
 
 Set `CCB_LOG_LEVEL=DEBUG` in the server's environment for per-event logging.
 

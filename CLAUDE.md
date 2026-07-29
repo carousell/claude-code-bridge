@@ -11,8 +11,25 @@ uv sync
 uv run pytest                                    # unit: fast, no auth, no tokens
 CCB_INTEGRATION=1 uv run pytest -m integration   # spawns real claude runs; costs real money
 uv run mcp dev src/claude_code_bridge/server.py  # MCP Inspector
-uv tool install . --force                        # reinstall the console script after changes
+uv tool install . --force                        # reinstall the console scripts after changes
+./install.sh                                     # full install + desktop-app registration
+claude-code-bridge-setup --dry-run               # show the config change without writing
 ```
+
+## Installer
+
+`install.sh` only bootstraps (`uv`, then `uv tool install`); all config editing lives in
+`setup_client.py` so it can be unit-tested. Two non-obvious rules there:
+
+- **Never symlink-resolve the `claude` path.** Claude Code installs `~/.local/bin/claude` as a
+  symlink into a versioned directory (`~/.local/share/claude/versions/<v>`). Resolving it pins
+  `PATH` to today's version, and dispatch breaks silently the next time Claude Code updates.
+- **`setup_client.py` edits a file it does not own.** Merge, never replace; back up first; refuse a
+  config that doesn't parse rather than overwriting it; write via tempfile + `os.replace`.
+
+The whole reason the installer exists: a GUI-launched process gets no useful `PATH`, so the command
+and `claude`'s directory both have to be written in absolutely. That failure mode is invisible
+until a dispatch fails with a confusing error.
 
 ## Verified CLI facts
 
