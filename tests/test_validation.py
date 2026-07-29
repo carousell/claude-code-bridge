@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,6 +110,83 @@ async def test_listing_reports_registered_tasks(fake_running_task: Task) -> None
 
     empty = await call("list_tasks", status="completed")
     assert empty.structured_content["result"] == []
+
+
+class RecordingContext:
+    """Stands in for the injected MCP Context, capturing progress reports."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.reports: list[tuple[float, float | None, str | None]] = []
+        self.fail = fail
+
+    async def report_progress(
+        self, progress: float, total: float | None = None, message: str | None = None
+    ) -> None:
+        if self.fail:
+            raise RuntimeError("client does not accept progress")
+        self.reports.append((progress, total, message))
+
+
+def test_default_wait_stays_under_a_typical_client_request_timeout() -> None:
+    """MCP clients time out requests around 60s, reporting -32001 while the task runs on."""
+    assert server.DEFAULT_WAIT_SECONDS < 60
+
+
+async def test_wait_emits_strictly_increasing_progress(
+    fake_running_task: Task, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "PROGRESS_INTERVAL_SECONDS", 0.01)
+    ctx = RecordingContext()
+
+    await server._await_with_progress(fake_running_task, 1, ctx)
+
+    values = [report[0] for report in ctx.reports]
+    assert values, "expected progress while the task was still running"
+    assert values == sorted(values)
+    assert len(set(values)) == len(values)
+
+
+async def test_wait_returns_immediately_once_finished(
+    fake_running_task: Task, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "PROGRESS_INTERVAL_SECONDS", 0.01)
+    fake_running_task.done.set()
+    ctx = RecordingContext()
+
+    await asyncio.wait_for(server._await_with_progress(fake_running_task, 30, ctx), timeout=1)
+
+    assert ctx.reports == []
+
+
+async def test_a_client_that_rejects_progress_does_not_break_the_wait(
+    fake_running_task: Task, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "PROGRESS_INTERVAL_SECONDS", 0.01)
+
+    await asyncio.wait_for(
+        server._await_with_progress(fake_running_task, 1, RecordingContext(fail=True)), timeout=5
+    )
+
+
+async def test_wait_tells_the_caller_what_to_do_when_still_running(
+    fake_running_task: Task, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "PROGRESS_INTERVAL_SECONDS", 0.01)
+
+    result = await call("wait_for_task", task_id=fake_running_task.task_id, timeout_seconds=1)
+
+    snapshot = result.structured_content
+    assert snapshot["status"] == "running"
+    assert "get_task_status" in snapshot["next_step"]
+
+
+async def test_no_next_step_hint_once_the_task_has_finished(fake_running_task: Task) -> None:
+    fake_running_task.status = "completed"
+    fake_running_task.done.set()
+
+    result = await call("wait_for_task", task_id=fake_running_task.task_id, timeout_seconds=1)
+
+    assert "next_step" not in result.structured_content
 
 
 @pytest.fixture

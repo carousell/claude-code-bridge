@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -13,6 +14,7 @@ from typing import Any
 
 from mcp import MCPError
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.types import INVALID_PARAMS
 
 from .cli import CLAUDE_BINARY, DEFAULT_MAX_TURNS, DISALLOWED_TOOLS
@@ -21,6 +23,16 @@ from .tasks import TERMINAL_STATUSES, SessionBusyError, Task, TaskRegistry
 log = logging.getLogger("claude_code_bridge")
 
 VALID_STATUSES = frozenset({"running"}) | TERMINAL_STATUSES
+
+# MCP clients impose their own per-request timeout — commonly 60s — and exceeding it surfaces to
+# the caller as a transport error (-32001) even though the dispatched run is unaffected. So the
+# default wait stays under that, and callers are expected to come back rather than hold one
+# request open for the length of a coding task.
+DEFAULT_WAIT_SECONDS = 55
+
+# Emitted while waiting so the client can see the wait is alive; per the MCP spec a client may
+# also reset its request timeout on progress, which is what makes longer explicit waits viable.
+PROGRESS_INTERVAL_SECONDS = 5.0
 
 mcp = MCPServer(
     "claude-code-bridge",
@@ -132,26 +144,71 @@ async def get_task_status(task_id: str) -> dict[str, Any]:
     return _require_task(task_id).snapshot()
 
 
+async def _await_with_progress(task: Task, timeout_seconds: int, ctx: Context | None) -> None:
+    """Wait for `task`, emitting progress every few seconds until it finishes or time runs out."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    steps = max(1, math.ceil(timeout_seconds / PROGRESS_INTERVAL_SECONDS))
+
+    for step in range(1, steps + 1):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return
+        try:
+            await asyncio.wait_for(
+                task.done.wait(), timeout=min(PROGRESS_INTERVAL_SECONDS, remaining)
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        if ctx is None:
+            continue
+        try:
+            await ctx.report_progress(
+                step,
+                total=steps,
+                message=f"{task.task_id} still running ({task.duration_seconds:.0f}s elapsed)",
+            )
+        except Exception:  # pragma: no cover - a client that ignores progress must not break us
+            log.debug("task %s: client did not accept progress", task.task_id)
+
+
 @mcp.tool()
-async def wait_for_task(task_id: str, timeout_seconds: int = 600) -> dict[str, Any]:
+async def wait_for_task(
+    task_id: str,
+    timeout_seconds: int = DEFAULT_WAIT_SECONDS,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
     """Wait for a task to finish, giving up after a timeout without disturbing the run.
 
     Args:
         task_id: Identifier of the task to await.
-        timeout_seconds: How long to wait before returning early.
+        timeout_seconds: How long to wait before returning early. Keep this modest — your MCP
+            client applies its own request timeout (often 60s), and exceeding it fails the *call*
+            with a timeout error even though the task keeps running.
+        ctx: Injected by the server; not a caller argument.
 
-    On timeout the task is left running and the returned status is still "running", so you can
-    call again later or switch to polling. The process is never signalled here.
+    If the task is still going when the wait ends, the result comes back with status "running" and
+    a `next_step` hint: just call this again, or poll get_task_status. The dispatched process is
+    never signalled here, so waiting is always safe and repeating it costs nothing.
+
+    A coding task can easily run for many minutes. Expect several calls rather than one long one.
     """
     if timeout_seconds <= 0:
         raise MCPError(INVALID_PARAMS, f"timeout_seconds must be > 0, got {timeout_seconds}")
 
     task = _require_task(task_id)
-    try:
-        await asyncio.wait_for(task.done.wait(), timeout=timeout_seconds)
-    except asyncio.TimeoutError:
+    await _await_with_progress(task, timeout_seconds, ctx)
+
+    snapshot = task.snapshot()
+    if not task.finished:
         log.info("task %s still running after %ss wait", task_id, timeout_seconds)
-    return task.snapshot()
+        snapshot["next_step"] = (
+            f"still running after {timeout_seconds}s and unaffected by this wait — "
+            "call wait_for_task again, or poll get_task_status"
+        )
+    return snapshot
 
 
 @mcp.tool()
