@@ -73,7 +73,8 @@ inside the block and re-raises after closing — copy that pattern.
    Cancellation therefore sets `cancel_requested`, and `_monitor` reads it.
    The one status `_monitor` must *not* publish is one for a process that is still alive. When its
    own `CancelledError` arrives the server is being torn down, not the run, so it leaves the task
-   `running` and re-raises. See "When the client restarts the server" — this cost real work once.
+   `running` and re-raises — unless a cancellation is already in flight, whose intent nothing on
+   disk could reconstruct. See "When the client restarts the server" — this cost real work once.
 3. **The stdout drainer is load-bearing.** stream-json is verbose; an unread pipe fills and blocks
    `claude` forever. The raw log is best-effort for exactly this reason — a full disk must never
    cost us the drain. If the drainer dies anyway it SIGKILLs the group rather than leaving a
@@ -127,6 +128,11 @@ exit code. Reversing those two turns a deliberate cancellation into `completed` 
 reproduced, now pinned by a test). For the same reason `cancel_recovered` waits for the SIGKILL to
 land: `resolve_status` rechecks liveness on a `cancelled` record, so returning early would answer a
 cancellation with "running".
+
+Everything that asks "has this settled?" must go through `resolve_status`, never read
+`record.status` directly. `_poll_recovered` did the latter and so ended a 55s wait after one 5s tick
+on a poisoned record — then reported that the full timeout had elapsed. A wait that returns early
+while claiming otherwise is worse than one that blocks.
 
 **What this does not fix.** The orphan's output is gone regardless: its pipes died with the server,
 so the raw log stops at the teardown and no summary can ever arrive for the rest of that run — the
