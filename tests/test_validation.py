@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from mcp import Client, MCPError
 
-from claude_code_bridge import server
+from claude_code_bridge import server, store
 from claude_code_bridge.tasks import Task
 
 
@@ -187,6 +187,57 @@ async def test_no_next_step_hint_once_the_task_has_finished(fake_running_task: T
     result = await call("wait_for_task", task_id=fake_running_task.task_id, timeout_seconds=1)
 
     assert "next_step" not in result.structured_content
+
+
+async def test_waiting_on_a_recovered_task_does_not_believe_a_stale_terminal_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `failed` record about a live process must not end the wait after one interval.
+
+    Breaking on the record's own status returned in a single tick while `next_step` claimed the
+    whole timeout had elapsed — a wait that looked like it had done its job and had not.
+    """
+    monkeypatch.setattr(server, "PROGRESS_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(store, "process_alive", lambda pid, session: True)
+    log_dir = server._reg().log_dir
+    record = store.TaskRecord(
+        task_id="orphan",
+        session_id="session-1",
+        repo_path="/tmp",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        pid=4321,
+        pgid=4321,
+        status="failed",  # what a torn-down server wrote about a run that kept going
+        exit_code=None,
+    )
+    store.write(log_dir, record)
+
+    ctx = RecordingContext()
+    await server._poll_recovered(record, 1, ctx)
+
+    assert len(ctx.reports) > 1, "the wait ended early instead of polling for its full timeout"
+
+
+async def test_waiting_on_a_recovered_task_stops_once_it_has_really_settled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(server, "PROGRESS_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(store, "process_alive", lambda pid, session: False)
+    record = store.TaskRecord(
+        task_id="settled",
+        session_id="session-1",
+        repo_path="/tmp",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        pid=4321,
+        status="completed",
+        exit_code=0,
+    )
+    store.write(server._reg().log_dir, record)
+
+    ctx = RecordingContext()
+    await asyncio.wait_for(server._poll_recovered(record, 30, ctx), timeout=2)
+
+    assert ctx.reports == []
 
 
 @pytest.fixture

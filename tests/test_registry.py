@@ -12,7 +12,6 @@ import pytest
 from claude_code_bridge import store
 from claude_code_bridge import tasks as tasks_module
 from claude_code_bridge.tasks import (
-    TERMINAL_STATUSES,
     RepoUnavailableError,
     SessionBusyError,
     Task,
@@ -140,11 +139,13 @@ async def test_finish_draining_returns_as_soon_as_the_drainers_do(tmp_path: Path
     assert all(watcher.done() and not watcher.cancelled() for watcher in task.watchers)
 
 
-async def test_a_cancelled_monitor_still_publishes_a_terminal_status(tmp_path: Path) -> None:
-    """`done` must never be observable next to a non-terminal status.
+async def test_a_cancelled_monitor_leaves_a_live_run_recorded_as_running(tmp_path: Path) -> None:
+    """A torn-down server must not record an outcome for a process that is still alive.
 
-    CancelledError bypasses the monitor's `except Exception`, so the invariant relies on its
-    `finally` backstop. Uses a plain `sleep` process rather than a real `claude` run.
+    This is what a client restarting the bridge does to every in-flight task. Writing a terminal
+    status here was observed to strand live `claude` runs: `store.write` then refuses to correct the
+    record, so no later server can see the process is still going. Uses a plain `sleep` process
+    rather than a real `claude` run.
     """
     registry = TaskRegistry(log_dir=tmp_path)
     proc = await asyncio.create_subprocess_exec(
@@ -158,6 +159,7 @@ async def test_a_cancelled_monitor_still_publishes_a_terminal_status(tmp_path: P
     task.proc = proc
     task.pgid = proc.pid
     registry._tasks[task.task_id] = task
+    registry.persist(task)
     task.watchers = [
         asyncio.create_task(tasks_module._drain_stdout(task)),
         asyncio.create_task(tasks_module._drain_stderr(task)),
@@ -168,14 +170,76 @@ async def test_a_cancelled_monitor_still_publishes_a_terminal_status(tmp_path: P
     monitor.cancel()
     await asyncio.gather(monitor, return_exceptions=True)
 
-    assert task.finished
-    assert task.status in TERMINAL_STATUSES
+    assert task.status == "running"
+    assert not task.finished
+    assert store.read(tmp_path, task.task_id).status == "running"
 
     tasks_module._signal_group(task, signal.SIGKILL)
     for watcher in task.watchers:
         watcher.cancel()
     await asyncio.gather(*task.watchers, return_exceptions=True)
     await proc.wait()
+
+
+async def test_a_teardown_mid_cancellation_still_records_the_cancellation(tmp_path: Path) -> None:
+    """Cancellation intent is the one thing recovery cannot reconstruct.
+
+    A signalled run dies without a result event, so leaving the record `running` would have the next
+    server infer `failed` and lose the fact that someone asked for this. Safe to record because a
+    `cancelled` record carries no exit code, so it is rechecked against the process.
+    """
+    registry = TaskRegistry(log_dir=tmp_path)
+    proc = await asyncio.create_subprocess_exec(
+        "sleep",
+        "30",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    task = make_task(tmp_path, "t0")
+    task.proc = proc
+    task.pgid = proc.pid
+    task.cancel_requested = True
+    registry._tasks[task.task_id] = task
+    registry.persist(task)
+
+    monitor = asyncio.create_task(tasks_module._monitor(task, registry))
+    await asyncio.sleep(0.05)
+    monitor.cancel()
+    await asyncio.gather(monitor, return_exceptions=True)
+
+    assert task.status == "cancelled"
+    assert store.read(tmp_path, task.task_id).status == "cancelled"
+
+    tasks_module._signal_group(task, signal.SIGKILL)
+    await proc.wait()
+
+
+async def test_a_monitor_that_crashes_still_publishes_a_terminal_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`done` must never be observable next to a non-terminal status.
+
+    The cancellation path deliberately leaves the task running, so the `finally` backstop is still
+    load-bearing for every other way the monitor can fail.
+    """
+    registry = TaskRegistry(log_dir=tmp_path)
+    proc = await asyncio.create_subprocess_exec("true", start_new_session=True)
+    task = make_task(tmp_path, "t0")
+    task.proc = proc
+    task.pgid = proc.pid
+    registry._tasks[task.task_id] = task
+
+    async def boom(_: Task) -> None:
+        raise RuntimeError("drain bookkeeping exploded")
+
+    monkeypatch.setattr(tasks_module, "_finish_draining", boom)
+
+    await tasks_module._monitor(task, registry)
+
+    assert task.finished
+    assert task.status == "failed"
+    assert store.read(tmp_path, task.task_id).status == "failed"
 
 
 async def test_cancel_recovered_does_not_claim_success_it_cannot_deliver(
@@ -198,6 +262,44 @@ async def test_cancel_recovered_does_not_claim_success_it_cannot_deliver(
 
     assert result.status == "running"
     assert store.read(tmp_path, "orphan").status == "running"
+
+
+async def test_cancel_recovered_waits_for_the_sigkill_to_land(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Returning while the group is still dying makes the response contradict itself.
+
+    `store.resolve_status` rechecks liveness for a `cancelled` record, so answering a cancellation
+    before the process is gone reports the task as still running.
+    """
+    monkeypatch.setattr(tasks_module, "SIGKILL_GRACE_SECONDS", 0.05)
+    registry = TaskRegistry(log_dir=tmp_path)
+    record = store.TaskRecord(
+        task_id="orphan",
+        session_id="s1",
+        repo_path=str(tmp_path),
+        started_at=datetime.now(timezone.utc).isoformat(),
+        pid=1234,
+        pgid=1234,
+    )
+    store.write(tmp_path, record)
+
+    killed = False
+
+    def signal_group(_: store.TaskRecord, sig: int) -> bool:
+        nonlocal killed
+        if sig == signal.SIGKILL:
+            killed = True
+        return True
+
+    monkeypatch.setattr(tasks_module, "_signal_recorded_group", signal_group)
+    monkeypatch.setattr(store, "process_alive", lambda pid, session: not killed)
+
+    result = await registry.cancel_recovered(record)
+
+    assert killed
+    assert result.status == "cancelled"
+    assert store.resolve_status(tmp_path, result)[0] == "cancelled"
 
 
 async def test_cancel_recovered_of_an_already_dead_task_changes_nothing(tmp_path: Path) -> None:
