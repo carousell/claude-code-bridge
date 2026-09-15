@@ -138,7 +138,13 @@ async def start_claude_code_task(
         raise MCPError(INVALID_PARAMS, "prompt must be a non-empty string")
 
     path = await _validate_repo_path(repo_path)
-    task = await _reg().start(prompt, path, max_turns=max_turns, model=model)
+    try:
+        task = await _reg().start(prompt, path, max_turns=max_turns, model=model)
+    except ValueError as exc:
+        # `build_claude_argv` refuses an option-shaped `model`, which is caller input reaching the
+        # option region directly. Without this it surfaces as an internal tool failure rather than
+        # the bad parameter it is.
+        raise MCPError(INVALID_PARAMS, str(exc)) from None
     return task.brief()
 
 
@@ -340,6 +346,10 @@ async def resume_claude_code_task(
                 )
             task = await _reg().resume_record(record, followup_prompt, max_turns=max_turns)
     except (SessionBusyError, RepoUnavailableError) as exc:
+        raise MCPError(INVALID_PARAMS, str(exc)) from None
+    except ValueError as exc:
+        # A resumed or recovered task reuses its stored `model`, so a record holding an
+        # option-shaped value reaches `build_claude_argv` here rather than on the start path.
         raise MCPError(INVALID_PARAMS, str(exc)) from None
     return task.brief()
 

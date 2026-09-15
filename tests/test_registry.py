@@ -360,3 +360,28 @@ async def test_cancelling_a_finished_task_is_a_no_op(tmp_path: Path) -> None:
 
     assert task.status == "completed"
     assert not task.cancel_requested
+
+
+async def test_a_blank_model_is_not_persisted_as_though_it_were_chosen(
+    git_repo, tmp_path, monkeypatch
+) -> None:
+    """What is reported has to match what ran.
+
+    A blank model is omitted from argv, so persisting the original `""` would leave the record and
+    every snapshot claiming a model the run never used.
+    """
+    captured: dict = {}
+
+    async def fake_spawn(self, argv, **kwargs):
+        captured.update(kwargs)
+        captured["argv"] = argv
+        raise RuntimeError("stop before spawning")
+
+    monkeypatch.setattr(TaskRegistry, "_spawn", fake_spawn)
+    registry = TaskRegistry(log_dir=tmp_path)
+
+    with pytest.raises(RuntimeError, match="stop before spawning"):
+        await registry.start("x", git_repo, max_turns=5, model="   ")
+
+    assert "--model" not in captured["argv"]
+    assert captured["model"] is None, "a blank model must not be persisted as a chosen one"

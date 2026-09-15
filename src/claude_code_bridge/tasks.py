@@ -176,6 +176,10 @@ class TaskRegistry:
     ) -> Task:
         """Dispatch a fresh session. Returns once the subprocess exists, not once it finishes."""
         session_id = str(uuid.uuid4())
+        # Normalised once, here, rather than only inside the argv builder: a blank model means "no
+        # model chosen" and is omitted from argv, so persisting the original `""` would have the
+        # record and every snapshot claim a model the run never used.
+        model = model if (model or "").strip() else None
         argv = build_claude_argv(
             prompt, session_id=session_id, max_turns=max_turns, model=model
         )

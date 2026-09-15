@@ -254,3 +254,42 @@ def fake_running_task(tmp_path: Path) -> Task:
     )
     server._reg()._tasks[task.task_id] = task
     return task
+
+
+# --- caller-supplied `model` reaching the option region -----------------------------------------
+# `model` rides inside the option region rather than after `--`, so unlike the prompt it is not
+# protected by the separator. `build_claude_argv` refuses an option-shaped value; these prove the
+# refusal surfaces as a parameter error rather than an internal tool failure.
+
+
+async def test_an_option_shaped_model_is_an_invalid_parameter_not_a_crash(git_repo: Path) -> None:
+    with pytest.raises(MCPError, match="must not look like an option"):
+        await call(
+            "start_claude_code_task",
+            prompt="x",
+            repo_path=str(git_repo),
+            model="--dangerously-skip-permissions",
+        )
+
+
+async def test_an_unsafe_persisted_model_is_an_invalid_parameter_on_resume(tmp_path: Path) -> None:
+    """The resume path reuses the stored `model`, so a poisoned record reaches argv construction
+    there rather than on the start path — and must fail the same way."""
+    task = Task(
+        task_id="task-poisoned",
+        session_id="session-poisoned",
+        repo_path=tmp_path,
+        prompt="x",
+        max_turns=5,
+        log_path=tmp_path / "task-poisoned.jsonl",
+        started_at=datetime.now(timezone.utc),
+        model="--dangerously-skip-permissions",
+        status="completed",
+        finished_at=datetime.now(timezone.utc),
+    )
+    # `finished` is the gate, not the status field — it reads `done`, which the monitor sets.
+    task.done.set()
+    server._reg()._tasks[task.task_id] = task
+
+    with pytest.raises(MCPError, match="must not look like an option"):
+        await call("resume_claude_code_task", task_id=task.task_id, followup_prompt="more")

@@ -38,7 +38,10 @@ until a dispatch fails with a confusing error.
 
 ## Verified CLI facts
 
-Established empirically against `claude` 2.1.220. Do not "simplify" these away:
+Established empirically against `claude` 2.1.220, except the argv-shape facts below which were
+re-measured against 2.1.272 while fixing the argv-safety holes — a discrepancy worth recording
+rather than silently overwriting, since it means everything else here is due for re-verification
+next time the CLI is upgraded. Do not "simplify" these away:
 
 - **`--verbose` is mandatory** with `-p --output-format stream-json`. Without it the CLI exits
   immediately with `Error: When using --print, --output-format=stream-json requires --verbose`.
@@ -51,6 +54,18 @@ Established empirically against `claude` 2.1.220. Do not "simplify" these away:
 - The stream carries `system`/`init`, `system`/`hook_*`, `assistant`, `user`, `rate_limit_event`
   and a final `result` event. Only `init`/`result` matter; everything else must be ignored, not
   assumed absent.
+- **`-p`/`--print` is a boolean flag; the prompt is a separate declared positional** (measured
+  against 2.1.272: `claude --help`'s own usage line is `claude [options] [command] [prompt]`). A
+  prompt token that happens to exactly equal a real option name (e.g.
+  `--dangerously-skip-permissions`) is parsed by claude as that option, not as text, unless
+  something marks where options end — so `cli.build_claude_argv` puts every flag first, then a
+  `--` separator, then the prompt alone as the sole positional, and `cli.assert_safe` requires that
+  shape and re-parses the option region strictly rather than searching it. Measured severity with
+  the *old* shape (prompt bare, before the flags) and a prompt of `--disallowed-tools=`: claude
+  initialised, ran SessionStart hooks, then exited 1 for lack of a prompt — the run fails outright,
+  it does not silently proceed with an emptied deny list. The restructured shape was measured
+  working end to end with this package's exact flags, `result`/`is_error: false` returned and the
+  session id preserved, with the option-shaped prompt delivered as literal text.
 
 ## MCP SDK
 
